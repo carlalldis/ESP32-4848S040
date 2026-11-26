@@ -30,6 +30,7 @@
 #include <Arduino.h>
 #include <ArduinoLog.h>
 #include <esp_task_wdt.h>
+#include <esp32s3/rom/cache.h>
 
 /*******************************************************************************
  * Start of Arduino_GFX setting
@@ -152,27 +153,69 @@ Arduino_ST7701_RGBPanel *gfx = new Arduino_ST7701_RGBPanel(
  ******************************************************************************/
 #include "touch.h"
 
-/* Change to your screen resolution */
+/* LVGL draw buffer height in lines (internal SRAM). Two of these are
+ * allocated so LVGL can render one while the other is copied to the screen. */
+#define DRAW_BUF_LINES 60
+
+/* RGB pixel clock. 8MHz was the flicker fix; try 10-12MHz for a faster panel
+ * refresh (8MHz ~= 28Hz, 12MHz ~= 42Hz) if it stays stable. */
+#define DISPLAY_PCLK_HZ 14000000
+
 static uint32_t screenWidth;
 static uint32_t screenHeight;
 static lv_disp_draw_buf_t draw_buf;
-static lv_color_t *disp_draw_buf;
 static lv_disp_drv_t disp_drv;
 
-/* Display flushing */
-void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area,
-                   lv_color_t *color_p) {
+/* Copy a rendered area straight into the PSRAM framebuffer with memcpy, then
+ * write the cache back once so the RGB DMA sees the new pixels. */
+static void IRAM_ATTR copy_to_framebuffer(const lv_area_t *area,
+                                          const lv_color_t *color_p) {
   uint32_t w = (area->x2 - area->x1 + 1);
   uint32_t h = (area->y2 - area->y1 + 1);
 
-#if (LV_COLOR_16_SWAP != 0)
-  gfx->draw16bitBeRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w,
-                            h);
-#else
-  gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
-#endif
+  uint16_t *fb = gfx->getFramebuffer();
+  uint16_t *dst = fb + area->y1 * screenWidth + area->x1;
+  const uint16_t *src = (const uint16_t *)&color_p->full;
+  if (w == screenWidth) {
+    memcpy(dst, src, w * h * 2);
+  } else {
+    for (uint32_t y = 0; y < h; y++) {
+      memcpy(dst, src, w * 2);
+      dst += screenWidth;
+      src += w;
+    }
+  }
+  Cache_WriteBack_Addr((uint32_t)(fb + area->y1 * screenWidth),
+                       screenWidth * h * 2);
+}
 
-  lv_disp_flush_ready(disp);
+/* Async flush: the copy runs in a task on core 0 while LVGL keeps rendering
+ * the next chunk into the other buffer on core 1. */
+struct flush_job_t {
+  lv_area_t area;
+  lv_color_t *color_p;
+};
+static QueueHandle_t flush_queue = NULL;
+
+static void flush_task(void *arg) {
+  flush_job_t job;
+  for (;;) {
+    if (xQueueReceive(flush_queue, &job, portMAX_DELAY) == pdTRUE) {
+      copy_to_framebuffer(&job.area, job.color_p);
+      lv_disp_flush_ready(&disp_drv);
+    }
+  }
+}
+
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area,
+                   lv_color_t *color_p) {
+  if (flush_queue) {
+    flush_job_t job = {*area, color_p};
+    xQueueSend(flush_queue, &job, portMAX_DELAY);
+  } else {
+    copy_to_framebuffer(area, color_p);
+    lv_disp_flush_ready(disp);
+  }
 }
 
 void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
@@ -237,7 +280,7 @@ void setup() {
   // Init Display
   // gfx->begin();
 
-  gfx->begin(8000000); /* 8MHz (160MHz/20) avoids PSRAM GDMA underrun tearing/warping */
+  gfx->begin(DISPLAY_PCLK_HZ); /* low pclk avoids PSRAM GDMA underrun tearing/warping */
 
   gfx->fillScreen(NAVY);
 
@@ -251,18 +294,25 @@ void setup() {
   screenWidth = gfx->width();
   screenHeight = gfx->height();
   Log.verbose(F("Width: %l, Height: %l" CR), screenWidth, screenHeight);
-#ifdef ESP32
-  disp_draw_buf =
-      (lv_color_t *)heap_caps_malloc(sizeof(lv_color_t) * screenWidth * 40,
-                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#else
-  disp_draw_buf = (lv_color_t *)malloc(sizeof(lv_color_t) * screenWidth * 40);
-#endif
-  if (!disp_draw_buf) {
+  const size_t buf_px = screenWidth * DRAW_BUF_LINES;
+  lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(
+      sizeof(lv_color_t) * buf_px, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(
+      sizeof(lv_color_t) * buf_px, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!buf1) {
     Serial.println("LVGL disp_draw_buf allocate failed!");
   } else {
+    if (buf2) {
+      /* Double buffered: hand flushing off to core 0 */
+      flush_queue = xQueueCreate(1, sizeof(flush_job_t));
+      xTaskCreatePinnedToCore(flush_task, "lv_flush", 4096, NULL,
+                              configMAX_PRIORITIES - 2, NULL, 0);
+      Log.verbose(F("Double buffered, async flush on core 0" CR));
+    } else {
+      Log.warning(F("Only one draw buffer, flushing synchronously" CR));
+    }
     logSection("lv_disp_draw_buf_init");
-    lv_disp_draw_buf_init(&draw_buf, disp_draw_buf, NULL, screenWidth * 40);
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, buf_px);
 
     /* Initialize the display */
     lv_disp_drv_init(&disp_drv);
@@ -271,6 +321,7 @@ void setup() {
     disp_drv.ver_res = screenHeight;
     disp_drv.flush_cb = my_disp_flush;
     disp_drv.draw_buf = &draw_buf;
+    disp_drv.antialiasing = 1; /* smooth text and shape edges (0 also thresholds font glyphs) */
     lv_disp_drv_register(&disp_drv);
 
     /* Initialize the (dummy) input device driver */
@@ -288,6 +339,7 @@ void setup() {
 }
 
 void loop() {
-  lv_timer_handler(); /* let the GUI do its work */
-  delay(5);
+  esp_task_wdt_reset(); /* feed the watchdog, otherwise it reboots the board */
+  uint32_t wait_ms = lv_timer_handler(); /* let the GUI do its work */
+  delay(wait_ms > 5 ? 5 : (wait_ms ? wait_ms : 1));
 }

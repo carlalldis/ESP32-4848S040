@@ -93,6 +93,43 @@ static uint32_t session_mobile = 1000;
  *   GLOBAL FUNCTIONS
  **********************/
 
+/* 1: flat, fast UI (no shadows, square corners, no gradients/fades,
+ * opaque text). 0: original look. */
+#ifndef DEMO_FLAT_UI
+#define DEMO_FLAT_UI 1
+#endif
+#define DEMO_RADIUS(r) (DEMO_FLAT_UI ? 0 : (r))
+
+#if DEMO_FLAT_UI
+static lv_theme_t flat_theme;
+static lv_style_t flat_style;
+
+static void flat_theme_apply_cb(lv_theme_t * th, lv_obj_t * obj)
+{
+    LV_UNUSED(th);
+    lv_obj_add_style(obj, &flat_style, LV_PART_MAIN);
+    lv_obj_add_style(obj, &flat_style, LV_PART_INDICATOR);
+    lv_obj_add_style(obj, &flat_style, LV_PART_KNOB);
+    lv_obj_add_style(obj, &flat_style, LV_PART_ITEMS);
+    lv_obj_add_style(obj, &flat_style, LV_PART_SCROLLBAR);
+}
+
+/* Layer a theme on top of the default one that strips the expensive bits */
+static void flat_theme_init(void)
+{
+    lv_style_init(&flat_style);
+    lv_style_set_radius(&flat_style, 0);
+    lv_style_set_shadow_width(&flat_style, 0);
+    lv_style_set_bg_grad_dir(&flat_style, LV_GRAD_DIR_NONE);
+
+    lv_theme_t * th_default = lv_disp_get_theme(NULL);
+    flat_theme = *th_default;
+    lv_theme_set_parent(&flat_theme, th_default);
+    lv_theme_set_apply_cb(&flat_theme, flat_theme_apply_cb);
+    lv_disp_set_theme(NULL, &flat_theme);
+}
+#endif
+
 void lv_demo_widgets(void)
 {
     if(LV_HOR_RES <= 320) disp_size = DISP_SMALL;
@@ -144,9 +181,16 @@ void lv_demo_widgets(void)
 #if LV_USE_THEME_DEFAULT
     lv_theme_default_init(NULL, lv_palette_main(LV_PALETTE_BLUE), lv_palette_main(LV_PALETTE_RED), LV_THEME_DEFAULT_DARK, font_normal);
 #endif
+#if DEMO_FLAT_UI
+    flat_theme_init();
+#endif
 
     lv_style_init(&style_text_muted);
+#if DEMO_FLAT_UI
+    lv_style_set_text_color(&style_text_muted, lv_palette_main(LV_PALETTE_GREY));
+#else
     lv_style_set_text_opa(&style_text_muted, LV_OPA_50);
+#endif
 
     lv_style_init(&style_title);
     lv_style_set_text_font(&style_title, font_large);
@@ -157,7 +201,7 @@ void lv_demo_widgets(void)
 
     lv_style_init(&style_bullet);
     lv_style_set_border_width(&style_bullet, 0);
-    lv_style_set_radius(&style_bullet, LV_RADIUS_CIRCLE);
+    lv_style_set_radius(&style_bullet, DEMO_RADIUS(LV_RADIUS_CIRCLE));
 
     tv = lv_tabview_create(lv_scr_act(), LV_DIR_TOP, tab_h);
 
@@ -700,7 +744,7 @@ static void analytics_create(lv_obj_t * parent)
     /*Add a special circle to the needle's pivot*/
     lv_obj_set_style_pad_hor(meter3, 10, 0);
     lv_obj_set_style_size(meter3, 10, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(meter3, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(meter3, DEMO_RADIUS(LV_RADIUS_CIRCLE), LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(meter3, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(meter3, lv_palette_darken(LV_PALETTE_GREY, 4), LV_PART_INDICATOR);
     lv_obj_set_style_outline_color(meter3, lv_color_white(), LV_PART_INDICATOR);
@@ -960,7 +1004,7 @@ static void color_changer_create(lv_obj_t * parent)
     lv_obj_set_style_bg_color(color_cont, lv_color_white(), 0);
     lv_obj_set_style_pad_right(color_cont, disp_size == DISP_SMALL ? LV_DPX(47) : LV_DPX(55), 0);
     lv_obj_set_style_bg_opa(color_cont, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(color_cont, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_radius(color_cont, DEMO_RADIUS(LV_RADIUS_CIRCLE), 0);
 
     if(disp_size == DISP_SMALL) lv_obj_set_size(color_cont, LV_DPX(52), LV_DPX(52));
     else lv_obj_set_size(color_cont, LV_DPX(60), LV_DPX(60));
@@ -971,7 +1015,7 @@ static void color_changer_create(lv_obj_t * parent)
     for(i = 0; palette[i] != _LV_PALETTE_LAST; i++) {
         lv_obj_t * c = lv_btn_create(color_cont);
         lv_obj_set_style_bg_color(c, lv_palette_main(palette[i]), 0);
-        lv_obj_set_style_radius(c, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_radius(c, DEMO_RADIUS(LV_RADIUS_CIRCLE), 0);
         lv_obj_set_style_opa(c, LV_OPA_TRANSP, 0);
         lv_obj_set_size(c, 20, 20);
         lv_obj_add_event_cb(c, color_event_cb, LV_EVENT_ALL, &palette[i]);
@@ -982,7 +1026,7 @@ static void color_changer_create(lv_obj_t * parent)
     lv_obj_add_flag(btn, LV_OBJ_FLAG_FLOATING | LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_bg_color(btn, lv_color_white(), LV_STATE_CHECKED);
     lv_obj_set_style_pad_all(btn, 10, 0);
-    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_radius(btn, DEMO_RADIUS(LV_RADIUS_CIRCLE), 0);
     lv_obj_add_event_cb(btn, color_changer_event_cb, LV_EVENT_ALL, color_cont);
     lv_obj_set_style_shadow_width(btn, 0, 0);
     lv_obj_set_style_bg_img_src(btn, LV_SYMBOL_TINT, 0);
@@ -1284,7 +1328,7 @@ static void slider_event_cb(lv_event_t * e)
             lv_draw_rect_dsc_t rect_dsc;
             lv_draw_rect_dsc_init(&rect_dsc);
             rect_dsc.bg_color = lv_palette_darken(LV_PALETTE_GREY, 3);
-            rect_dsc.radius = LV_DPX(5);
+            rect_dsc.radius = DEMO_RADIUS(LV_DPX(5));
             lv_draw_rect(dsc->draw_ctx, &rect_dsc, &bg_area);
 
             lv_draw_label_dsc_t label_dsc;
@@ -1319,7 +1363,7 @@ static void chart_event_cb(lv_event_t * e)
 
         /*Add the faded area before the lines are drawn */
         else if(dsc->part == LV_PART_ITEMS) {
-#if LV_DRAW_COMPLEX
+#if LV_DRAW_COMPLEX && !DEMO_FLAT_UI
             /*Add  a line mask that keeps the area below the line*/
             if(dsc->p1 && dsc->p2) {
                 lv_draw_mask_line_param_t line_mask_param;
@@ -1363,9 +1407,14 @@ static void chart_event_cb(lv_event_t * e)
                     dsc->rect_dsc->outline_color = lv_color_white();
                     dsc->rect_dsc->outline_width = 2;
                 } else {
+#if DEMO_FLAT_UI
+                    dsc->rect_dsc->outline_color = lv_color_white();
+                    dsc->rect_dsc->outline_width = 2;
+#else
                     dsc->rect_dsc->shadow_color = ser->color;
                     dsc->rect_dsc->shadow_width = 15;
                     dsc->rect_dsc->shadow_spread = 0;
+#endif
                 }
 
                 char buf[8];
@@ -1401,7 +1450,7 @@ static void chart_event_cb(lv_event_t * e)
                 lv_draw_rect_dsc_t rect_dsc;
                 lv_draw_rect_dsc_init(&rect_dsc);
                 rect_dsc.bg_color = ser->color;
-                rect_dsc.radius = LV_DPX(5);
+                rect_dsc.radius = DEMO_RADIUS(LV_DPX(5));
                 lv_draw_rect(dsc->draw_ctx, &rect_dsc, &bg_area);
 
                 lv_draw_label_dsc_t label_dsc;
@@ -1452,7 +1501,7 @@ static void shop_chart_event_cb(lv_event_t * e)
             a.y1 = dsc->draw_area->y1;
             a.y2 = a.y1 + 4 + (devices[dsc->id] * h) / 100; /*+4 to overlap the radius*/
             draw_rect_dsc.bg_color = lv_palette_main(LV_PALETTE_RED);
-            draw_rect_dsc.radius = 4;
+            draw_rect_dsc.radius = DEMO_RADIUS(4);
             lv_draw_rect(dsc->draw_ctx, &draw_rect_dsc, &a);
 
             a.y1 = a.y2 - 4;                                    /*-4 to overlap the radius*/

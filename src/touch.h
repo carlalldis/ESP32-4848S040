@@ -112,6 +112,7 @@ void touch_init()
 #elif defined(TOUCH_GT911)
   Wire.begin(TOUCH_GT911_SDA, TOUCH_GT911_SCL);
   ts.begin();
+  Wire.setClock(400000); /* 400kHz I2C: default 100kHz blocks LVGL ~2ms per read */
   ts.setRotation(TOUCH_GT911_ROTATION);
 
 #elif defined(TOUCH_XPT2046)
