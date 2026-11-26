@@ -237,8 +237,7 @@ void setup() {
   // Init Display
   // gfx->begin();
 
-  gfx->begin(12000000); /* specify data bus speed (12MHz avoids PSRAM DMA
-                           underrun flicker) */
+  gfx->begin(8000000); /* 8MHz (160MHz/20) avoids PSRAM GDMA underrun tearing/warping */
 
   gfx->fillScreen(NAVY);
 
@@ -254,16 +253,16 @@ void setup() {
   Log.verbose(F("Width: %l, Height: %l" CR), screenWidth, screenHeight);
 #ifdef ESP32
   disp_draw_buf =
-      (lv_color_t *)heap_caps_malloc(sizeof(lv_color_t) * screenWidth * 200,
+      (lv_color_t *)heap_caps_malloc(sizeof(lv_color_t) * screenWidth * 40,
                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #else
-  disp_draw_buf = (lv_color_t *)malloc(sizeof(lv_color_t) * screenWidth * 200);
+  disp_draw_buf = (lv_color_t *)malloc(sizeof(lv_color_t) * screenWidth * 40);
 #endif
   if (!disp_draw_buf) {
     Serial.println("LVGL disp_draw_buf allocate failed!");
   } else {
     logSection("lv_disp_draw_buf_init");
-    lv_disp_draw_buf_init(&draw_buf, disp_draw_buf, NULL, screenWidth * 200);
+    lv_disp_draw_buf_init(&draw_buf, disp_draw_buf, NULL, screenWidth * 40);
 
     /* Initialize the display */
     lv_disp_drv_init(&disp_drv);
