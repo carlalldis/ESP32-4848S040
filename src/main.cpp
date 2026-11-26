@@ -1,32 +1,11 @@
 
 
 /*******************************************************************************
- * LVGL Widgets
- * This is a widgets demo for LVGL - Light and Versatile Graphics Library
- * import from: https://github.com/lvgl/lv_demos.git
- *
- * Dependent libraries:
- * LVGL: https://github.com/lvgl/lvgl.git
-
- * Touch libraries:
- * FT6X36: https://github.com/strange-v/FT6X36.git
- * GT911: https://github.com/TAMCTec/gt911-arduino.git
- * XPT2046: https://github.com/PaulStoffregen/XPT2046_Touchscreen.git
- *
- * LVGL Configuration file:
- * Copy your_arduino_path/libraries/lvgl/lv_conf_template.h
- * to your_arduino_path/libraries/lv_conf.h
- * Then find and set:
- * #define LV_COLOR_DEPTH     16
- * #define LV_TICK_CUSTOM     1
- *
- * For SPI display set color swap can be faster, parallel screen don't set!
- * #define LV_COLOR_16_SWAP   1
- *
- * Optional: Show CPU usage and FPS count
- * #define LV_USE_PERF_MONITOR 1
+ * NEON FLAP on the ESP32-4848S040 (ST7701S 480x480 RGB panel + GT911 touch).
+ * This file sets up the display, LVGL and touch; the game lives in neon_flap.cpp.
  ******************************************************************************/
-#include "lv_demo_widgets.h"
+#include "neon_flap.h"
+#include <lvgl.h>
 #include <Arduino.h>
 #include <ArduinoLog.h>
 #include <esp_task_wdt.h>
@@ -255,7 +234,7 @@ void setup() {
   // Log.setPrefix(logPrintPrefix);
   Log.begin(LOG_LEVEL, &Serial);
   delay(4000); // Wait for serial monitor to open
-  logSection("LVGL Widgets Demo");
+  logSection("NEON FLAP");
 
   logSection("ESP Information");
 
@@ -331,9 +310,7 @@ void setup() {
     indev_drv.read_cb = my_touchpad_read;
     lv_indev_drv_register(&indev_drv);
 
-    lv_demo_widgets();
-
-    Serial.println("DEmo done");
+    neon_flap_start();
   }
   Serial.println("Setup done");
 }
