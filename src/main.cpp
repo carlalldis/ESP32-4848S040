@@ -153,44 +153,25 @@ Arduino_ST7701_RGBPanel *gfx = new Arduino_ST7701_RGBPanel(
 #define DRAW_BUF_LINES 60
 #define DMA_FLUSH 0
 #else
-#define DRAW_BUF_LINES 32
+#define DRAW_BUF_LINES 24
 #define DMA_FLUSH 1
 #endif
 #include "dma_copy.h"
 
 /* RGB pixel clock (14MHz ~= 49Hz refresh). The panel streams its frame
- * buffer out of PSRAM continuously; if anything else hogs PSRAM the LCD's DMA
- * FIFO runs dry and the picture flickers/shifts. lcd_dma_prioritise() gives
- * the LCD channel first claim on the bus, and the log reports underflows. */
+ * buffer out of PSRAM continuously (~23MB/s at 14MHz); if anything else hogs
+ * PSRAM the LCD's DMA FIFO runs dry and the picture flickers. So: apps keep
+ * their hot data in SRAM, and the LCD's GDMA channel gets top priority. */
 #ifndef DISPLAY_PCLK_HZ
-#define DISPLAY_PCLK_HZ 14000000
-#endif
-#ifndef LCD_DMA_PRIO
-#define LCD_DMA_PRIO 9
+#define DISPLAY_PCLK_HZ 8000000
 #endif
 
 #include <soc/gdma_struct.h>
-static int lcd_dma_ch = -1;
-volatile uint32_t g_lcd_underflows = 0; /* polls that saw the LCD FIFO run dry */
-
 /* Find the GDMA channel feeding the LCD (peripheral 5 = LCD_CAM) and put it
  * at the top of the arbitration priority (everyone else defaults to 0). */
 static void lcd_dma_prioritise() {
   for (int i = 0; i < 5; i++)
-    if (GDMA.channel[i].out.peri_sel.sel == 5) {
-      lcd_dma_ch = i;
-      GDMA.channel[i].out.pri.tx_pri = LCD_DMA_PRIO;
-    }
-  Log.verbose(F("LCD GDMA channel: %d" CR), lcd_dma_ch);
-}
-
-static void lcd_underflow_poll() {
-  if (lcd_dma_ch < 0) return;
-  const uint32_t raw = GDMA.channel[lcd_dma_ch].out.int_raw.val;
-  if (raw & (BIT(5) | BIT(7))) { /* outfifo_udf_l1 / outfifo_udf_l3 */
-    g_lcd_underflows++;
-    GDMA.channel[lcd_dma_ch].out.int_clr.val = BIT(5) | BIT(7);
-  }
+    if (GDMA.channel[i].out.peri_sel.sel == 5) GDMA.channel[i].out.pri.tx_pri = 9;
 }
 
 static uint32_t screenWidth;
@@ -470,7 +451,6 @@ static void serial_screenshot_poll() {
 void loop() {
   esp_task_wdt_reset(); /* feed the watchdog, otherwise it reboots the board */
   uint32_t wait_ms = lv_timer_handler(); /* let the GUI do its work */
-  lcd_underflow_poll();
   serial_screenshot_poll();
   delay(wait_ms > 5 ? 5 : (wait_ms ? wait_ms : 1));
 }

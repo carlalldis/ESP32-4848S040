@@ -17,26 +17,26 @@
  *                   phantom food... and now and then it writes you a message.
  *
  * Threads / memory:
- *   sim task (core 0)  agents + diffusion on a 256x256 torus in internal SRAM
- *                      (power-of-two so every wrap is a mask), then publishes a
- *                      copy into a PSRAM triple buffer.
- *   LVGL (core 1)      DRAW_MAIN renders the centre 240x240 of the newest
- *                      published map straight into LVGL's strip buffer: exact
- *                      2x bilinear upscale of both species at once (SWAR),
- *                      4x4 ordered dither, 2-D colour LUT (A x B -> RGB565).
+ *   sim task (core 0)  agents + diffusion on a 256x256 torus (power-of-two so
+ *                      every wrap is a mask); a helper on core 1 steals agent
+ *                      chunks whenever LVGL is idle.
+ *   LVGL (core 1)      DRAW_MAIN renders the centre 240x240 of the map straight
+ *                      into LVGL's strip buffer: exact 2x bilinear upscale of
+ *                      both species at once (SWAR), 4x4 ordered dither, 2-D
+ *                      colour LUT (A x B -> RGB565). A frame and the in-place
+ *                      diffuse never overlap.
+ *   Everything hot lives in internal SRAM: PSRAM bandwidth belongs to the LCD,
+ *   which streams the frame buffer from it nonstop (starve it -> flicker).
  ******************************************************************************/
 #include "physarum.h"
-#include "dma_copy.h"
 #include "touch_points.h"
 #include <Arduino.h>
-#include <esp32s3/rom/cache.h>
 #include <esp_heap_caps.h>
 #include <lvgl.h>
 #include <math.h>
 #include <string.h>
 
-extern volatile uint32_t g_flush_us;       // main.cpp: time spent copying to the panel
-extern volatile uint32_t g_lcd_underflows; // main.cpp: LCD DMA FIFO ran dry (flicker)
+extern volatile uint32_t g_flush_us; // main.cpp: CPU time spent copying to the panel
 
 namespace {
 
@@ -49,7 +49,7 @@ constexpr int PMASK = SW * SUB - 1;  // 4095: positions wrap with a mask
 constexpr int FW = SW / 2, FH = SH / 2; // food field, one sample per 2x2 cells
 constexpr int TMAX = 251;            // trail ceiling: keeps 16x sums < 4096
 #ifndef PHYSARUM_AGENTS
-#define PHYSARUM_AGENTS 18000
+#define PHYSARUM_AGENTS 9000
 #endif
 constexpr int AGENTS_PER_SPECIES = PHYSARUM_AGENTS;
 constexpr int MAX_FOOD = 24;
@@ -107,10 +107,10 @@ struct Preset {
   Params p;
 };
 const Preset PRESETS[] = {
-    {"VEINS", {22.5f, 45.0f, 9.0f, 1.0f, 14.0f, 0.90f, 0.70f}},
-    {"LABYRINTH", {45.0f, 30.0f, 5.5f, 1.0f, 12.0f, 0.88f, 0.85f}},
-    {"CELLS", {60.0f, 20.0f, 15.0f, 1.3f, 12.0f, 0.92f, 1.00f}},
-    {"CURRENTS", {12.0f, 8.0f, 20.0f, 1.6f, 10.0f, 0.93f, 0.55f}},
+    {"VEINS", {22.5f, 45.0f, 9.0f, 1.0f, 28.0f, 0.90f, 0.70f}},
+    {"LABYRINTH", {45.0f, 30.0f, 5.5f, 1.0f, 24.0f, 0.88f, 0.85f}},
+    {"CELLS", {60.0f, 20.0f, 15.0f, 1.3f, 24.0f, 0.92f, 1.00f}},
+    {"CURRENTS", {12.0f, 8.0f, 20.0f, 1.6f, 20.0f, 0.93f, 0.55f}},
 };
 constexpr int N_PRESETS = sizeof(PRESETS) / sizeof(PRESETS[0]);
 
@@ -221,12 +221,8 @@ portMUX_TYPE simMux = portMUX_INITIALIZER_UNLOCKED;
 
 uint16_t *trail;   // SRAM: per cell, species A low byte, species B high byte
 uint8_t *food;     // SRAM: food attraction, FW x FH
-uint32_t *agents;  // x:12 | y:12 | heading:8
+uint32_t *agentsOf[2]; // SRAM, per species: x:12 | y:12 | heading:8
 int nAgents[2] = {AGENTS_PER_SPECIES, AGENTS_PER_SPECIES};
-uint16_t *disp[3]; // PSRAM: published trail maps (triple buffer)
-volatile int dispLatest = 0, dispReading = 0;
-volatile uint32_t dispSeq = 0;
-portMUX_TYPE dispMux = portMUX_INITIALIZER_UNLOCKED;
 uint16_t *lut;       // SRAM: active colour LUT
 uint16_t *themeLuts; // PSRAM: every theme's LUT
 uint16_t *lutFrom;   // PSRAM: LUT snapshot when a crossfade starts
@@ -400,9 +396,10 @@ void depositText(float amt) {
 }
 
 /* ------------------------------------------------------------- seeding -- */
-inline void setAgent(int i, float x, float y, int heading) {
+inline void setAgent(int i, float x, float y, int heading) { // i: 0 .. nA+nB
   const uint32_t px = iround(x * SUB) & PMASK, py = iround(y * SUB) & PMASK;
-  agents[i] = px | (py << 12) | ((uint32_t)(heading & 255) << 24);
+  uint32_t *a = i < nAgents[0] ? &agentsOf[0][i] : &agentsOf[1][i - nAgents[0]];
+  *a = px | (py << 12) | ((uint32_t)(heading & 255) << 24);
 }
 
 /* Species A starts as a tight spore in the centre heading out; species B as a
@@ -456,9 +453,8 @@ inline int claimChunk() { return __atomic_fetch_add(&workNext, 1, __ATOMIC_RELAX
 void runChunk(int idx, uint32_t &rng) {
   const int chunksA = (nAgents[0] + CHUNK - 1) / CHUNK;
   const int s = idx < chunksA ? 0 : 1;
-  const int first = s ? nAgents[0] + (idx - chunksA) * CHUNK : idx * CHUNK;
-  const int end = s ? nAgents[0] + nAgents[1] : nAgents[0];
-  stepSpecies(s, workFood, agents + first, min(CHUNK, end - first), simD, rng);
+  const int first = (s ? idx - chunksA : idx) * CHUNK;
+  stepSpecies(s, workFood, agentsOf[s] + first, min(CHUNK, nAgents[s] - first), simD, rng);
 }
 
 volatile uint32_t statHelperChunks;
@@ -474,32 +470,25 @@ void helperTask(void *) {
 }
 
 /* --------------------------------------------------------- the sim task -- */
-/* Publishing = copying the trail map into a free display buffer, by DMA. The
- * copy runs while the next step's agents already move (their deposits racing
- * the copy are harmless); only the next diffuse has to wait for it. */
-DmaCopy *pubDma;
-volatile int pubTarget = 0;
+/* The renderer reads the trail map in SRAM directly - no copies through PSRAM,
+ * whose bandwidth belongs to the LCD (starve it and the panel flickers).
+ * Agents may keep depositing while a frame is drawn (invisible), but the
+ * in-place diffuse would tear it, so a frame and a diffuse never overlap:
+ *   frameActive  set by the UI tick when it starts a frame, cleared by the
+ *                renderer after the last strip
+ *   diffusing    set by the sim around diffuse(); no frame starts meanwhile */
+volatile bool frameActive = false, diffusing = false;
+portMUX_TYPE frameMux = portMUX_INITIALIZER_UNLOCKED;
 
-void IRAM_ATTR publishDone(void *) {
-  portENTER_CRITICAL_ISR(&dispMux);
-  dispLatest = pubTarget;
-  dispSeq++;
-  portEXIT_CRITICAL_ISR(&dispMux);
-}
-
-void publish() {
-  int w = 0;
-  portENTER_CRITICAL(&dispMux);
-  while (w == dispLatest || w == dispReading) w++;
-  portEXIT_CRITICAL(&dispMux);
-  pubTarget = w;
-  if (!dma_copy_start(pubDma, disp[w], trail, NCELL * sizeof(uint16_t), publishDone, nullptr)) {
-    memcpy(disp[w], trail, NCELL * sizeof(uint16_t)); // no DMA: CPU copy
-    Cache_WriteBack_Addr((uint32_t)disp[w], NCELL * sizeof(uint16_t));
-    portENTER_CRITICAL(&dispMux);
-    dispLatest = w;
-    dispSeq++;
-    portEXIT_CRITICAL(&dispMux);
+void beginDiffuse() {
+  const uint32_t t0 = millis();
+  for (;;) {
+    portENTER_CRITICAL(&frameMux);
+    const bool ok = !frameActive || millis() - t0 > 100; // never deadlock
+    if (ok) diffusing = true;
+    portEXIT_CRITICAL(&frameMux);
+    if (ok) return;
+    vTaskDelay(1); // also lets IDLE0 feed the task watchdog
   }
 }
 
@@ -507,8 +496,6 @@ void simTask(void *) {
   static SimInput in;
   Derived &d = simD;
   uint32_t rng = esp_random() | 1;
-  uint32_t lastPub = 0;
-  pubDma = dma_copy_create(NCELL * sizeof(uint16_t)); // ISR lands on core 0
   for (;;) {
     const uint32_t t0 = micros();
     portENTER_CRITICAL(&simMux);
@@ -535,87 +522,27 @@ void simTask(void *) {
     xTaskNotifyGive(helperHandle); // core 1 joins in whenever LVGL is idle
     for (int idx; (idx = claimChunk()) < workTotal;) runChunk(idx, rng);
     const uint32_t t2 = micros();
-    dma_copy_wait(pubDma); // the last publish must be done reading the map
+    beginDiffuse(); // wait for the frame being drawn to finish
     const uint32_t t3 = micros();
     // integer decay factor, dithered over steps so the average is exact
     static uint32_t decayFrac = 0;
     decayFrac += d.decay88 & 0xFF;
     diffuse((d.decay88 >> 8) + (decayFrac >> 8));
     decayFrac &= 0xFF;
+    diffusing = false;
     const uint32_t t4 = micros();
     statSteps++;
     statAgentUs += t2 - t1;
     statDiffuseUs += t4 - t3;
-    statPubUs += t3 - t2; // time spent waiting for the publish DMA
+    statPubUs += t3 - t2; // time spent waiting for the renderer
+    statPubs++;
 
-    // Publish once the renderer has picked up the previous frame.
-    const uint32_t nowMs = millis();
-    if (dispReading == dispLatest || nowMs - lastPub > 40) {
-      publish();
-      lastPub = nowMs;
-      statPubs++;
-      vTaskDelay(1); // let IDLE0 run so the task watchdog stays fed
-    }
     const uint32_t el = micros() - t0;
-    if (el + 1000 < STEP_US) vTaskDelay((STEP_US - el) / 1000);
+    vTaskDelay(el + 2000 < STEP_US ? (STEP_US - el) / 1000 : 1); // IDLE0 needs a turn
   }
 }
 
 /* ------------------------------------------------------------ rendering -- */
-/* The renderer never reads the PSRAM display buffers with the CPU: they are
- * written by DMA behind the cache's back, and reading them through the cache
- * risks stale lines (and stalls on a busy bus). Instead each LVGL strip's
- * source rows are DMA'd into a small SRAM buffer, and the next strip's rows
- * are prefetched while the current one renders. */
-constexpr int STRIP_ROWS = 20; // source rows one 32-line strip can need (+slack)
-const uint16_t *renderSrc;     // published map being shown (PSRAM)
-DmaCopy *rowDma;
-uint16_t *rowBuf[2];            // SRAM, STRIP_ROWS full rows each
-const uint16_t *rowFrom[2];     // which published map each buffer came from
-int rowFirst[2], rowCount[2];   // which source rows each buffer holds
-int rowInFlight = -1;           // buffer whose DMA hasn't been waited for
-const uint16_t *curRows;        // rows for the strip being rendered...
-int curFirst;                   // ...starting at this source row
-
-void fetchRows(int b, int r0, int r1) {
-  if (rowInFlight >= 0) dma_copy_wait(rowDma);
-  rowInFlight = -1;
-  rowFrom[b] = renderSrc;
-  rowFirst[b] = r0;
-  rowCount[b] = r1 - r0 + 1;
-  if (dma_copy_start(rowDma, rowBuf[b], renderSrc + r0 * SW, rowCount[b] * SW * 2, nullptr, nullptr))
-    rowInFlight = b;
-  else
-    rowFrom[b] = nullptr; // couldn't start: never trust this buffer
-}
-
-/* Source rows covering output rows y0..y1 (inclusive): ours plus neighbours. */
-inline int firstRowFor(int y0) { return OFF + (y0 >> 1) - 1; }
-inline int lastRowFor(int y1) { return OFF + (y1 >> 1) + 1; }
-
-/* Make rows r0..r1 available in SRAM and point curRows at them. */
-bool needRows(int r0, int r1) {
-  if (r1 - r0 + 1 > STRIP_ROWS || !rowDma) return false;
-  for (int b = 0; b < 2; b++)
-    if (rowFrom[b] == renderSrc && rowFirst[b] <= r0 && r1 < rowFirst[b] + rowCount[b]) {
-      if (rowInFlight == b) {
-        dma_copy_wait(rowDma);
-        rowInFlight = -1;
-      }
-      curRows = rowBuf[b];
-      curFirst = rowFirst[b];
-      return true;
-    }
-  const int b = rowInFlight == 0 ? 1 : 0;
-  fetchRows(b, r0, r1);
-  if (rowInFlight != b) return false;
-  dma_copy_wait(rowDma);
-  rowInFlight = -1;
-  curRows = rowBuf[b];
-  curFirst = r0;
-  return true;
-}
-
 /* Unpacked ("wide") copies of the source rows the current output rows need:
  * each visible source row is used by three output rows but unpacked once. */
 uint32_t wideRows[3][VIS + 2];
@@ -634,7 +561,7 @@ inline const uint32_t *getWide(int r) {
   int s = 0;
   for (int k = 1; k < 3; k++)
     if (wideStamp[k] < wideStamp[s]) s = k;
-  const uint16_t *src = curRows + (r - curFirst) * SW + OFF - 1;
+  const uint16_t *src = trail + r * SW + OFF - 1;
   uint32_t *dst = wideRows[s];
   for (int i = 0; i < VIS + 2; i++) dst[i] = wide(src[i]);
   wideKey[s] = r;
@@ -677,12 +604,7 @@ void render(lv_draw_ctx_t *ctx) {
   uint16_t *buf = (uint16_t *)ctx->buf;
   const bool fullRow = clip->x1 == 0 && clip->x2 == W - 1 && ba->x1 == 0 && bw == W;
   const int y0 = max<int>(clip->y1, 0), y1 = min<int>(clip->y2, H - 1);
-  if (y1 < y0 || !needRows(firstRowFor(y0), lastRowFor(y1))) return;
-  // Prefetch the next strip's rows while this one renders.
-  if (y1 + 1 < H && lastRowFor(min(y1 + 32, H - 1)) - firstRowFor(y1 + 1) < STRIP_ROWS) {
-    const int other = curRows == rowBuf[0] ? 1 : 0;
-    fetchRows(other, firstRowFor(y1 + 1), lastRowFor(min(y1 + 32, H - 1)));
-  }
+  if (y0 == 0) wideKey[0] = wideKey[1] = wideKey[2] = -1; // map moved on
   for (int y = y0; y <= y1; y++) {
     uint16_t *row = buf + (y - ba->y1) * bw - ba->x1; // index by screen x
     if (fullRow) {
@@ -693,6 +615,7 @@ void render(lv_draw_ctx_t *ctx) {
     }
   }
   if (clip->y1 == 0) statFrames++;
+  if (y1 == H - 1) frameActive = false; // last strip: the sim may diffuse
   statRenderUs += micros() - t0;
 }
 
@@ -1130,7 +1053,7 @@ void pushSimInput() {
 }
 
 void logStats() {
-  static uint32_t lastMs, lSteps, lAg, lDi, lPu, lPubs, lFrames, lRender, lFlush, lHelp, lUdf;
+  static uint32_t lastMs, lSteps, lAg, lDi, lPu, lPubs, lFrames, lRender, lFlush, lHelp;
   const uint32_t now = millis();
   if (now - lastMs < 5000) return;
   const float secs = (now - lastMs) / 1000.0f;
@@ -1139,15 +1062,14 @@ void logStats() {
   auto per = [](uint32_t us, uint32_t n) { return n ? us / 1000.0f / n : 0.0f; };
   const float helpPct = steps ? 100.0f * (statHelperChunks - lHelp) / (steps * (float)workTotal) : 0;
   Serial.printf("[physarum] %.1f fps (render %.2f + flush %.2f ms) | sim %.1f steps/s "
-                "(agents %.2f [core1 did %.0f%%], diffuse %.2f, publish %.2f ms) | %s/%s | "
-                "SRAM %u (min %u) | LCD underflows %u\n",
+                "(agents %.2f [core1 did %.0f%%], diffuse %.2f, wait %.2f ms) | %s/%s | "
+                "SRAM %u (min %u)\n",
                 frames / secs, per(statRenderUs - lRender, frames),
                 per(g_flush_us - lFlush, frames), steps / secs,
                 per(statAgentUs - lAg, steps), helpPct, per(statDiffuseUs - lDi, steps),
                 per(statPubUs - lPu, pubs), PRESETS[presetIdx].name,
                 THEMES[themeIdx].name, heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL), g_lcd_underflows - lUdf);
-  lUdf = g_lcd_underflows;
+                heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
   lHelp = statHelperChunks;
   lastMs = now;
   lSteps = statSteps;
@@ -1170,23 +1092,26 @@ void tick(lv_timer_t *) {
   processTouches(now);
   story(dt);
   updateTheme(dt);
-  fadeUpdate(caption, dt);
-  fadeUpdate(toast, dt);
   pushSimInput();
 
-  static uint32_t renderedSeq = 0; // hand the newest published frame to LVGL
-  if (dispSeq != renderedSeq) {
-    portENTER_CRITICAL(&dispMux);
-    dispReading = dispLatest;
-    renderedSeq = dispSeq;
-    portEXIT_CRITICAL(&dispMux);
-    renderSrc = disp[dispReading];
-    // The display buffers are recycled, so rows fetched earlier may carry the
-    // same pointer but older data: forget them, and start on strip 0 now.
-    rowFrom[0] = rowFrom[1] = nullptr;
-    wideKey[0] = wideKey[1] = wideKey[2] = -1;
-    fetchRows(0, firstRowFor(0), lastRowFor(31));
-    lv_obj_invalidate(simObj);
+  // Start a frame once the sim has stepped since the last one and isn't
+  // diffusing. Label fades are applied only here too, so nothing is ever
+  // redrawn while the map is mid-diffuse.
+  static uint32_t renderedStep = 0;
+  static float fadeDt = 0;
+  fadeDt += dt;
+  if (statSteps != renderedStep && !frameActive) {
+    portENTER_CRITICAL(&frameMux);
+    const bool go = !diffusing;
+    if (go) frameActive = true;
+    portEXIT_CRITICAL(&frameMux);
+    if (go) {
+      renderedStep = statSteps;
+      fadeUpdate(caption, fadeDt);
+      fadeUpdate(toast, fadeDt);
+      fadeDt = 0;
+      lv_obj_invalidate(simObj);
+    }
   }
   logStats();
 }
@@ -1303,35 +1228,19 @@ void physarum_start() {
   Serial.printf("[physarum] SRAM free before alloc: %u (largest %u)\n",
                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-  trail = alloc<uint16_t>(NCELL, SRAM | MALLOC_CAP_DMA, "trail map");
+  // Biggest first, so the agents get the rest of the large block before the
+  // small buffers fragment it. Agents are read and rewritten every step: they
+  // must stay out of PSRAM, whose bandwidth the LCD needs.
+  trail = alloc<uint16_t>(NCELL, SRAM, "trail map");
+  for (int s = 0; s < 2; s++) agentsOf[s] = alloc<uint32_t>(nAgents[s], SRAM, "agents");
   food = alloc<uint8_t>(FW * FH, SRAM, "food field");
   lut = alloc<uint16_t>(LUT_SIZE, SRAM, "colour LUT");
-  const size_t agentBytes = (size_t)(nAgents[0] + nAgents[1]) * 4;
-#ifdef PHYSARUM_AGENTS_SRAM
-  const bool agentsFit = PHYSARUM_AGENTS_SRAM;
-#else
-  const bool agentsFit = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) > agentBytes + 40000;
-#endif
-  agents = alloc<uint32_t>(nAgents[0] + nAgents[1], agentsFit ? SRAM : PSRAM, "agents");
-  for (int i = 0; i < 3; i++) { // DMA targets: 64-byte aligned, not in cache
-    disp[i] = (uint16_t *)heap_caps_aligned_alloc(64, NCELL * sizeof(uint16_t), PSRAM);
-    if (!disp[i]) {
-      Serial.println("[physarum] display buffer: allocation failed!");
-      continue;
-    }
-    memset(disp[i], 0, NCELL * sizeof(uint16_t));
-    Cache_WriteBack_Addr((uint32_t)disp[i], NCELL * sizeof(uint16_t));
-    Cache_Invalidate_Addr((uint32_t)disp[i], NCELL * sizeof(uint16_t));
-  }
   themeLuts = alloc<uint16_t>(LUT_SIZE * N_THEMES, PSRAM, "theme LUTs");
   lutFrom = alloc<uint16_t>(LUT_SIZE, PSRAM, "LUT snapshot");
-  for (int b = 0; b < 2; b++)
-    rowBuf[b] = alloc<uint16_t>(STRIP_ROWS * SW, SRAM | MALLOC_CAP_DMA, "strip rows");
-  rowDma = dma_copy_create(STRIP_ROWS * SW * sizeof(uint16_t));
   textMask = alloc<uint8_t>(FW * FH, PSRAM, "text mask");
   textCells = alloc<uint16_t>(MAX_TEXT_CELLS, PSRAM, "text cells");
-  Serial.printf("[physarum] agents in %s; SRAM free after alloc: %u\n",
-                agentsFit ? "SRAM" : "PSRAM", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  Serial.printf("[physarum] %d agents; SRAM free after alloc: %u\n", nAgents[0] + nAgents[1],
+                heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
   for (int t = 0; t < N_THEMES; t++)
     for (int ia = 0; ia < LUT_N; ia++)
@@ -1343,7 +1252,6 @@ void physarum_start() {
   pCur = pFrom = pTo = PRESETS[0].p;
   uint32_t seed = esp_random() | 1;
   seedIntro(seed);
-  renderSrc = disp[0];
 
   buildUI();
   prepareText("HELLO", 2.2f);

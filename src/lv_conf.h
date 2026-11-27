@@ -56,7 +56,7 @@
     #if defined(APP_NEON_FLAP)
         #define LV_MEM_SIZE (128U*1024U)
     #else
-        #define LV_MEM_SIZE (48U*1024U)
+        #define LV_MEM_SIZE (32U*1024U)
     #endif
 
 /*Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too.*/
