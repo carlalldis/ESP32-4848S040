@@ -41,7 +41,13 @@
 // #define TOUCH_MAP_Y1 100
 // #define TOUCH_MAP_Y2 4000
 
+#include "touch_points.h"
+
 int touch_last_x = 0, touch_last_y = 0;
+
+int touch_count = 0;
+int16_t touch_pts_x[TOUCH_MAX_POINTS], touch_pts_y[TOUCH_MAX_POINTS];
+uint8_t touch_pts_id[TOUCH_MAX_POINTS];
 
 #if defined(TOUCH_FT6X36)
 #include <Wire.h>
@@ -157,17 +163,26 @@ bool touch_touched()
   ts.read();
   if (ts.isTouched)
   {
+    const int n = min((int)ts.touches, TOUCH_MAX_POINTS);
+    for (int i = 0; i < n; i++)
+    {
 #if defined(TOUCH_SWAP_XY)
-    touch_last_x = map(ts.points[0].y, TOUCH_MAP_X1, TOUCH_MAP_X2, 0, gfx->width() - 1);
-    touch_last_y = map(ts.points[0].x, TOUCH_MAP_Y1, TOUCH_MAP_Y2, 0, gfx->height() - 1);
+      touch_pts_x[i] = map(ts.points[i].y, TOUCH_MAP_X1, TOUCH_MAP_X2, 0, gfx->width() - 1);
+      touch_pts_y[i] = map(ts.points[i].x, TOUCH_MAP_Y1, TOUCH_MAP_Y2, 0, gfx->height() - 1);
 #else
-    touch_last_x = map(ts.points[0].x, TOUCH_MAP_X1, TOUCH_MAP_X2, 0, gfx->width() - 1);
-    touch_last_y = map(ts.points[0].y, TOUCH_MAP_Y1, TOUCH_MAP_Y2, 0, gfx->height() - 1);
+      touch_pts_x[i] = map(ts.points[i].x, TOUCH_MAP_X1, TOUCH_MAP_X2, 0, gfx->width() - 1);
+      touch_pts_y[i] = map(ts.points[i].y, TOUCH_MAP_Y1, TOUCH_MAP_Y2, 0, gfx->height() - 1);
 #endif
+      touch_pts_id[i] = ts.points[i].id;
+    }
+    touch_count = n;
+    touch_last_x = touch_pts_x[0];
+    touch_last_y = touch_pts_y[0];
     return true;
   }
   else
   {
+    touch_count = 0;
     return false;
   }
 

@@ -1,10 +1,22 @@
 
 
 /*******************************************************************************
- * NEON FLAP on the ESP32-4848S040 (ST7701S 480x480 RGB panel + GT911 touch).
- * This file sets up the display, LVGL and touch; the game lives in neon_flap.cpp.
+ * ESP32-4848S040 (ST7701S 480x480 RGB panel + GT911 touch).
+ * This file sets up the display, LVGL and touch, then starts one app:
+ *   default            PHYSARUM, a living slime mould (physarum.cpp)
+ *   -D APP_NEON_FLAP   NEON FLAP, the cyberpunk flappy game (neon_flap.cpp)
+ * (platformio.ini has an env for each.)
+ *
+ * Serial: send 'S' (240x240) or 'F' (480x480) to get a screenshot of the
+ * frame buffer; scripts/screenshot.py turns it into a PNG.
  ******************************************************************************/
+#if defined(APP_NEON_FLAP)
 #include "neon_flap.h"
+#define APP_NAME "NEON FLAP"
+#else
+#include "physarum.h"
+#define APP_NAME "PHYSARUM"
+#endif
 #include <lvgl.h>
 #include <Arduino.h>
 #include <ArduinoLog.h>
@@ -132,23 +144,67 @@ Arduino_ST7701_RGBPanel *gfx = new Arduino_ST7701_RGBPanel(
  ******************************************************************************/
 #include "touch.h"
 
-/* LVGL draw buffer height in lines (internal SRAM). Two of these are
- * allocated so LVGL can render one while the other is copied to the screen. */
+/* LVGL draw buffers (internal SRAM): LVGL renders into one while the other is
+ * copied to the PSRAM frame buffer.
+ * NEON FLAP: the copy is a CPU memcpy in a task on core 0.
+ * PHYSARUM: its simulation owns core 0, so the copy is done by a GDMA channel
+ *           (dma_copy.cpp) - no CPU time at all, and no write-allocate. */
+#if defined(APP_NEON_FLAP)
 #define DRAW_BUF_LINES 60
+#define DMA_FLUSH 0
+#else
+#define DRAW_BUF_LINES 32
+#define DMA_FLUSH 1
+#endif
+#include "dma_copy.h"
 
-/* RGB pixel clock. 8MHz was the flicker fix; try 10-12MHz for a faster panel
- * refresh (8MHz ~= 28Hz, 12MHz ~= 42Hz) if it stays stable. */
+/* RGB pixel clock (14MHz ~= 49Hz refresh). The panel streams its frame
+ * buffer out of PSRAM continuously; if anything else hogs PSRAM the LCD's DMA
+ * FIFO runs dry and the picture flickers/shifts. lcd_dma_prioritise() gives
+ * the LCD channel first claim on the bus, and the log reports underflows. */
+#ifndef DISPLAY_PCLK_HZ
 #define DISPLAY_PCLK_HZ 14000000
+#endif
+#ifndef LCD_DMA_PRIO
+#define LCD_DMA_PRIO 9
+#endif
+
+#include <soc/gdma_struct.h>
+static int lcd_dma_ch = -1;
+volatile uint32_t g_lcd_underflows = 0; /* polls that saw the LCD FIFO run dry */
+
+/* Find the GDMA channel feeding the LCD (peripheral 5 = LCD_CAM) and put it
+ * at the top of the arbitration priority (everyone else defaults to 0). */
+static void lcd_dma_prioritise() {
+  for (int i = 0; i < 5; i++)
+    if (GDMA.channel[i].out.peri_sel.sel == 5) {
+      lcd_dma_ch = i;
+      GDMA.channel[i].out.pri.tx_pri = LCD_DMA_PRIO;
+    }
+  Log.verbose(F("LCD GDMA channel: %d" CR), lcd_dma_ch);
+}
+
+static void lcd_underflow_poll() {
+  if (lcd_dma_ch < 0) return;
+  const uint32_t raw = GDMA.channel[lcd_dma_ch].out.int_raw.val;
+  if (raw & (BIT(5) | BIT(7))) { /* outfifo_udf_l1 / outfifo_udf_l3 */
+    g_lcd_underflows++;
+    GDMA.channel[lcd_dma_ch].out.int_clr.val = BIT(5) | BIT(7);
+  }
+}
 
 static uint32_t screenWidth;
 static uint32_t screenHeight;
 static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
 
+volatile uint32_t g_flush_us = 0; /* total time spent in copy_to_framebuffer */
+
 /* Copy a rendered area straight into the PSRAM framebuffer with memcpy, then
  * write the cache back once so the RGB DMA sees the new pixels. */
 static void IRAM_ATTR copy_to_framebuffer(const lv_area_t *area,
                                           const lv_color_t *color_p) {
+  const uint32_t t0 = micros();
   uint32_t w = (area->x2 - area->x1 + 1);
   uint32_t h = (area->y2 - area->y1 + 1);
 
@@ -166,7 +222,17 @@ static void IRAM_ATTR copy_to_framebuffer(const lv_area_t *area,
   }
   Cache_WriteBack_Addr((uint32_t)(fb + area->y1 * screenWidth),
                        screenWidth * h * 2);
+#if DMA_FLUSH
+  /* DMA writes bypass the cache: drop these lines so a stale copy can never
+   * be written back over newer DMA'd pixels. */
+  Cache_Invalidate_Addr((uint32_t)(fb + area->y1 * screenWidth),
+                        screenWidth * h * 2);
+#endif
+  g_flush_us += micros() - t0;
 }
+
+static DmaCopy *flush_dma = NULL;
+static void IRAM_ATTR dma_flush_done(void *) { lv_disp_flush_ready(&disp_drv); }
 
 /* Async flush: the copy runs in a task on core 0 while LVGL keeps rendering
  * the next chunk into the other buffer on core 1. */
@@ -188,6 +254,14 @@ static void flush_task(void *arg) {
 
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area,
                    lv_color_t *color_p) {
+  /* Full-width strips are contiguous in the frame buffer (and every row
+   * starts 64-byte aligned): hand them to the DMA engine. */
+  if (flush_dma && area->x1 == 0 && area->x2 == (int)screenWidth - 1) {
+    uint16_t *dst = gfx->getFramebuffer() + area->y1 * screenWidth;
+    const size_t n = screenWidth * (area->y2 - area->y1 + 1) * 2;
+    if (dma_copy_start(flush_dma, dst, color_p, n, dma_flush_done, NULL))
+      return;
+  }
   if (flush_queue) {
     flush_job_t job = {*area, color_p};
     xQueueSend(flush_queue, &job, portMAX_DELAY);
@@ -234,7 +308,7 @@ void setup() {
   // Log.setPrefix(logPrintPrefix);
   Log.begin(LOG_LEVEL, &Serial);
   delay(4000); // Wait for serial monitor to open
-  logSection("NEON FLAP");
+  logSection(APP_NAME);
 
   logSection("ESP Information");
 
@@ -259,7 +333,8 @@ void setup() {
   // Init Display
   // gfx->begin();
 
-  gfx->begin(DISPLAY_PCLK_HZ); /* low pclk avoids PSRAM GDMA underrun tearing/warping */
+  gfx->begin(DISPLAY_PCLK_HZ);
+  lcd_dma_prioritise();
 
   gfx->fillScreen(NAVY);
 
@@ -274,20 +349,56 @@ void setup() {
   screenHeight = gfx->height();
   Log.verbose(F("Width: %l, Height: %l" CR), screenWidth, screenHeight);
   const size_t buf_px = screenWidth * DRAW_BUF_LINES;
-  lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(
-      sizeof(lv_color_t) * buf_px, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(
-      sizeof(lv_color_t) * buf_px, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t buf_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA;
+  lv_color_t *buf1 =
+      (lv_color_t *)heap_caps_malloc(sizeof(lv_color_t) * buf_px, buf_caps);
+  lv_color_t *buf2 =
+      (lv_color_t *)heap_caps_malloc(sizeof(lv_color_t) * buf_px, buf_caps);
   if (!buf1) {
     Serial.println("LVGL disp_draw_buf allocate failed!");
   } else {
-    if (buf2) {
+#if DMA_FLUSH
+    flush_dma = dma_copy_create(sizeof(lv_color_t) * buf_px);
+    if (flush_dma) { /* self-test: one small SRAM -> PSRAM copy */
+      uint8_t *s = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+      uint8_t *t = (uint8_t *)heap_caps_aligned_alloc(64, 4096, MALLOC_CAP_SPIRAM);
+      bool ok = s && t;
+      if (ok) {
+        for (int i = 0; i < 4096; i++) s[i] = i * 7;
+        memset(t, 0, 4096);
+        Cache_WriteBack_Addr((uint32_t)t, 4096);
+        Cache_Invalidate_Addr((uint32_t)t, 4096);
+        ok = dma_copy_start(flush_dma, t, s, 4096, NULL, NULL);
+        const uint32_t t0 = micros();
+        while (dma_copy_busy(flush_dma) && micros() - t0 < 100000) {
+        }
+        Cache_Invalidate_Addr((uint32_t)t, 4096);
+        for (int i = 0; ok && i < 4096; i++) ok = t[i] == (uint8_t)(i * 7);
+        ok = ok && !dma_copy_busy(flush_dma);
+      }
+      heap_caps_free(s);
+      heap_caps_free(t);
+      if (!ok) {
+        Log.warning(F("GDMA self-test failed, using CPU flush" CR));
+        flush_dma = NULL;
+      }
+    }
+    if (flush_dma) {
+      /* From here on only DMA writes the frame buffer: flush the CPU's view
+       * of it once so no stale dirty line is ever written back on top. */
+      uint16_t *fb = gfx->getFramebuffer();
+      Cache_WriteBack_Addr((uint32_t)fb, screenWidth * screenHeight * 2);
+      Cache_Invalidate_Addr((uint32_t)fb, screenWidth * screenHeight * 2);
+      Log.verbose(F("Double buffered, GDMA flush" CR));
+    }
+#endif
+    if (buf2 && !flush_dma) {
       /* Double buffered: hand flushing off to core 0 */
       flush_queue = xQueueCreate(1, sizeof(flush_job_t));
       xTaskCreatePinnedToCore(flush_task, "lv_flush", 4096, NULL,
                               configMAX_PRIORITIES - 2, NULL, 0);
       Log.verbose(F("Double buffered, async flush on core 0" CR));
-    } else {
+    } else if (!buf2) {
       Log.warning(F("Only one draw buffer, flushing synchronously" CR));
     }
     logSection("lv_disp_draw_buf_init");
@@ -310,13 +421,56 @@ void setup() {
     indev_drv.read_cb = my_touchpad_read;
     lv_indev_drv_register(&indev_drv);
 
+#if defined(APP_NEON_FLAP)
     neon_flap_start();
+#else
+    physarum_start();
+#endif
   }
   Serial.println("Setup done");
+}
+
+/* Screenshot over serial: 'S' = every other pixel (240x240), 'F' = full
+ * 480x480. Prints "SHOT w h" at the normal baud, switches to 921600 for the
+ * raw little-endian RGB565 rows, then switches back. LVGL is not serviced
+ * while sending, so the image is one consistent frame. */
+#define SHOT_BAUD 921600
+static void serial_screenshot_poll() {
+  if (!Serial.available()) return;
+  const int c = Serial.read();
+  if (c != 'S' && c != 'F') {
+#if !defined(APP_NEON_FLAP)
+    physarum_command(c); /* single-letter debug commands, see physarum.h */
+#endif
+    return;
+  }
+  const int step = c == 'F' ? 1 : 2;
+  const int w = screenWidth / step, h = screenHeight / step;
+  const uint16_t *fb = gfx->getFramebuffer();
+#if DMA_FLUSH
+  /* the frame buffer is written by DMA behind the cache's back */
+  Cache_Invalidate_Addr((uint32_t)fb, screenWidth * screenHeight * 2);
+#endif
+  static uint16_t line[480];
+  Serial.printf("\nSHOT %d %d\n", w, h);
+  Serial.flush();
+  Serial.updateBaudRate(SHOT_BAUD);
+  delay(300); /* give the host time to follow */
+  for (int y = 0; y < (int)screenHeight; y += step) {
+    const uint16_t *src = fb + y * screenWidth;
+    for (int x = 0, i = 0; x < (int)screenWidth; x += step) line[i++] = src[x];
+    Serial.write((const uint8_t *)line, w * 2);
+    esp_task_wdt_reset();
+  }
+  Serial.flush();
+  delay(50);
+  Serial.updateBaudRate(SERIAL_BAUD);
 }
 
 void loop() {
   esp_task_wdt_reset(); /* feed the watchdog, otherwise it reboots the board */
   uint32_t wait_ms = lv_timer_handler(); /* let the GUI do its work */
+  lcd_underflow_poll();
+  serial_screenshot_poll();
   delay(wait_ms > 5 ? 5 : (wait_ms ? wait_ms : 1));
 }
