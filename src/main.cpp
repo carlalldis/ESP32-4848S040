@@ -5,6 +5,7 @@
  * This file sets up the display, LVGL and touch, then starts one app:
  *   default            PHYSARUM, a living slime mould (physarum.cpp)
  *   -D APP_NEON_FLAP   NEON FLAP, the cyberpunk flappy game (neon_flap.cpp)
+ *   -D APP_NEON_WHACK  NEON WHACK, synthwave whack-a-mole (neon_whack.cpp)
  * (platformio.ini has an env for each.)
  *
  * Serial: send 'S' (240x240) or 'F' (480x480) to get a screenshot of the
@@ -13,6 +14,9 @@
 #if defined(APP_NEON_FLAP)
 #include "neon_flap.h"
 #define APP_NAME "NEON FLAP"
+#elif defined(APP_NEON_WHACK)
+#include "neon_whack.h"
+#define APP_NAME "NEON WHACK"
 #else
 #include "physarum.h"
 #define APP_NAME "PHYSARUM"
@@ -146,10 +150,10 @@ Arduino_ST7701_RGBPanel *gfx = new Arduino_ST7701_RGBPanel(
 
 /* LVGL draw buffers (internal SRAM): LVGL renders into one while the other is
  * copied to the PSRAM frame buffer.
- * NEON FLAP: the copy is a CPU memcpy in a task on core 0.
+ * NEON FLAP / NEON WHACK: the copy is a CPU memcpy in a task on core 0.
  * PHYSARUM: its simulation owns core 0, so the copy is done by a GDMA channel
  *           (dma_copy.cpp) - no CPU time at all, and no write-allocate. */
-#if defined(APP_NEON_FLAP)
+#if defined(APP_NEON_FLAP) || defined(APP_NEON_WHACK)
 #define DRAW_BUF_LINES 60
 #define DMA_FLUSH 0
 #else
@@ -404,6 +408,8 @@ void setup() {
 
 #if defined(APP_NEON_FLAP)
     neon_flap_start();
+#elif defined(APP_NEON_WHACK)
+    neon_whack_start();
 #else
     physarum_start();
 #endif
@@ -420,7 +426,7 @@ static void serial_screenshot_poll() {
   if (!Serial.available()) return;
   const int c = Serial.read();
   if (c != 'S' && c != 'F') {
-#if !defined(APP_NEON_FLAP)
+#if !defined(APP_NEON_FLAP) && !defined(APP_NEON_WHACK)
     physarum_command(c); /* single-letter debug commands, see physarum.h */
 #endif
     return;
