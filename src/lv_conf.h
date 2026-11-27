@@ -51,13 +51,8 @@
 #if LV_MEM_CUSTOM == 0
     /*Size of the memory available for `lv_mem_alloc()` in bytes (>= 2kB)*/
     //#define LV_MEM_SIZE (192U*1024U)          /*[bytes]*/
-    /*PHYSARUM needs the internal SRAM for its trail map and only has a few
-     *labels, so it gets a smaller pool; NEON FLAP keeps the original size.*/
-    #if defined(APP_NEON_FLAP)
-        #define LV_MEM_SIZE (128U*1024U)
-    #else
-        #define LV_MEM_SIZE (32U*1024U)
-    #endif
+    /*VIEWER 3D only has a few labels; internal SRAM goes to its mesh and z-buffer.*/
+    #define LV_MEM_SIZE (32U*1024U)
 
 /*Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too.*/
     #define LV_MEM_ADR 0     /*0: unused*/

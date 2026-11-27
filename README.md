@@ -41,3 +41,26 @@
 |11 | IO46 | 46 | log | DB9(G)
 |33 | IO47 | 47 | SPICLK_P | TF(SDA)
 |32 | IO48 | 48 | SPICLK_N | TF(SCK)
+## VIEWER 3D
+
+The firmware is a software-rendered 3-D viewer (`src/viewer3d.cpp`). Drop binary or ASCII
+STL files into `src/stl/`; `scripts/stl2h.py` runs before every build and turns them into
+`src/models_gen.h` (welded, centred, unit-sized, Blender Z-up -> Y-up, face and vertex
+normals, wireframe edges without flat-quad diagonals). Everything for one model has to fit in
+internal SRAM: a few thousand triangles is fine.
+
+| Touch | |
+| --- | --- |
+| tap | next render mode: wireframe, flat shaded, smooth shaded, hidden line |
+| tap the bottom-left / bottom-right corner | previous / next model |
+| drag | spin it yourself; auto rotation eases back in afterwards |
+| pinch | zoom |
+
+Serial (115200): `m` mode, `n`/`p` next/previous model, `a` auto rotation, `v` vsync lock,
+`S`/`F` screenshot (`scripts/screenshot.py`).
+
+Frames start on the panel's vsync (~28 Hz at the 8 MHz pixel clock) and are drawn top to
+bottom faster than the panel scans, so they never tear. Each frame redraws only the band of
+rows the model covers, and both cores share the work: the transform is split in half, and
+the rasteriser takes alternate rows of every LVGL strip. A GDMA channel copies the strips to
+the PSRAM frame buffer.

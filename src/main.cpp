@@ -2,26 +2,20 @@
 
 /*******************************************************************************
  * ESP32-4848S040 (ST7701S 480x480 RGB panel + GT911 touch).
- * This file sets up the display, LVGL and touch, then starts one app:
- *   default            PHYSARUM, a living slime mould (physarum.cpp)
- *   -D APP_NEON_FLAP   NEON FLAP, the cyberpunk flappy game (neon_flap.cpp)
- * (platformio.ini has an env for each.)
+ * This file sets up the display, LVGL and touch, then starts VIEWER 3D, a
+ * software-rendered STL viewer (viewer3d.cpp; models from src/stl/).
  *
  * Serial: send 'S' (240x240) or 'F' (480x480) to get a screenshot of the
  * frame buffer; scripts/screenshot.py turns it into a PNG.
  ******************************************************************************/
-#if defined(APP_NEON_FLAP)
-#include "neon_flap.h"
-#define APP_NAME "NEON FLAP"
-#else
-#include "physarum.h"
-#define APP_NAME "PHYSARUM"
-#endif
+#include "viewer3d.h"
+#define APP_NAME "VIEWER 3D"
 #include <lvgl.h>
 #include <Arduino.h>
 #include <ArduinoLog.h>
 #include <esp_task_wdt.h>
 #include <esp32s3/rom/cache.h>
+#include <soc/soc_memory_layout.h>
 
 /*******************************************************************************
  * Start of Arduino_GFX setting
@@ -145,17 +139,11 @@ Arduino_ST7701_RGBPanel *gfx = new Arduino_ST7701_RGBPanel(
 #include "touch.h"
 
 /* LVGL draw buffers (internal SRAM): LVGL renders into one while the other is
- * copied to the PSRAM frame buffer.
- * NEON FLAP: the copy is a CPU memcpy in a task on core 0.
- * PHYSARUM: its simulation owns core 0, so the copy is done by a GDMA channel
- *           (dma_copy.cpp) - no CPU time at all, and no write-allocate. */
-#if defined(APP_NEON_FLAP)
-#define DRAW_BUF_LINES 60
-#define DMA_FLUSH 0
-#else
-#define DRAW_BUF_LINES 24
+ * copied to the PSRAM frame buffer by a GDMA channel (dma_copy.cpp) - no CPU
+ * time at all, and no write-allocate. Both cores are busy rasterising, so
+ * the copy has to be free. (The 3-D viewer keeps a z-buffer the same size.) */
+#define DRAW_BUF_LINES 32
 #define DMA_FLUSH 1
-#endif
 #include "dma_copy.h"
 
 /* RGB pixel clock (14MHz ~= 49Hz refresh). The panel streams its frame
@@ -172,6 +160,46 @@ Arduino_ST7701_RGBPanel *gfx = new Arduino_ST7701_RGBPanel(
 static void lcd_dma_prioritise() {
   for (int i = 0; i < 5; i++)
     if (GDMA.channel[i].out.peri_sel.sel == 5) GDMA.channel[i].out.pri.tx_pri = 9;
+}
+
+/* VSYNC. The panel has one frame buffer that it scans out top to bottom
+ * (~28 times a second at 8MHz), so anything drawn while it scans tears.
+ * IDF 4.4's RGB driver can call back at the end of every vsync, but
+ * Arduino_GFX keeps its panel struct private: find it by scanning the bus
+ * object for the pointer whose frame buffer is ours (and only trust it if
+ * the size agrees too), then hook the callback. Apps call display_wait_vsync()
+ * right before drawing; drawing faster than the scan (~15 rows/ms) from the
+ * top then never tears. */
+static SemaphoreHandle_t vsync_sem = NULL;
+volatile uint32_t g_vsync_count = 0;
+
+static bool IRAM_ATTR on_vsync(esp_lcd_panel_handle_t, esp_lcd_rgb_panel_event_data_t *, void *) {
+  g_vsync_count++;
+  BaseType_t woke = pdFALSE;
+  xSemaphoreGiveFromISR(vsync_sem, &woke);
+  return woke == pdTRUE;
+}
+
+static bool hook_vsync(Arduino_ESP32RGBPanel *b, uint16_t *fb, size_t fbBytes) {
+  const uintptr_t *words = (const uintptr_t *)b;
+  for (size_t i = 0; i < sizeof(Arduino_ESP32RGBPanel) / sizeof(uintptr_t); i++) {
+    const uintptr_t v = words[i];
+    if (!v || (v & 3) || !esp_ptr_internal((void *)v)) continue;
+    esp_rgb_panel_t *p = (esp_rgb_panel_t *)v;
+    if (p->fb != (uint8_t *)fb || p->fb_size != fbBytes) continue;
+    vsync_sem = xSemaphoreCreateBinary();
+    p->user_ctx = NULL;
+    p->on_frame_trans_done = on_vsync;
+    return true;
+  }
+  return false;
+}
+
+/* Blocks until the next vsync ends (false on timeout or with no hook). */
+bool display_wait_vsync(uint32_t timeout_ms) {
+  if (!vsync_sem) return false;
+  xSemaphoreTake(vsync_sem, 0); /* drop a stale one: we want the next */
+  return xSemaphoreTake(vsync_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
 static uint32_t screenWidth;
@@ -316,6 +344,10 @@ void setup() {
 
   gfx->begin(DISPLAY_PCLK_HZ);
   lcd_dma_prioritise();
+  if (hook_vsync(bus, gfx->getFramebuffer(), gfx->width() * gfx->height() * 2))
+    Log.verbose(F("VSYNC callback hooked" CR));
+  else
+    Log.warning(F("VSYNC callback not found: frames may tear" CR));
 
   gfx->fillScreen(NAVY);
 
@@ -402,11 +434,7 @@ void setup() {
     indev_drv.read_cb = my_touchpad_read;
     lv_indev_drv_register(&indev_drv);
 
-#if defined(APP_NEON_FLAP)
-    neon_flap_start();
-#else
-    physarum_start();
-#endif
+    viewer3d_start();
   }
   Serial.println("Setup done");
 }
@@ -420,9 +448,7 @@ static void serial_screenshot_poll() {
   if (!Serial.available()) return;
   const int c = Serial.read();
   if (c != 'S' && c != 'F') {
-#if !defined(APP_NEON_FLAP)
-    physarum_command(c); /* single-letter debug commands, see physarum.h */
-#endif
+    viewer3d_command(c); /* single-letter debug commands, see viewer3d.h */
     return;
   }
   const int step = c == 'F' ? 1 : 2;
